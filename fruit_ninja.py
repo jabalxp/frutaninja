@@ -18,7 +18,7 @@ import threading
 import urllib.request
 import json
 import time
-from collections import deque
+from collections import deque, OrderedDict
 
 import cv2
 import mediapipe as mp
@@ -26,7 +26,7 @@ import numpy as np
 import pygame
 
 # ─── Constantes ────────────────────────────────────────────────────────────
-SCREEN_W, SCREEN_H = 1280, 720
+SCREEN_W, SCREEN_H = 1920, 1080
 FPS = 30
 MODEL_PATH = os.path.join(os.path.dirname(__file__), "hand_landmarker.task")
 
@@ -40,7 +40,7 @@ FRUIT_TYPES = {
     'abacaxi':  {'color': (220, 180, 10),  'inner': (255, 215, 60),  'seed': None},
 }
 
-GRAVITY        = 0.67
+GRAVITY        = 0.40
 INITIAL_LIVES  = 3
 TRAIL_LEN      = 20
 SLICE_VEL_MIN  = 6   # px/frame mínimo para cortar
@@ -114,16 +114,19 @@ def update_window_state(fullscreen):
         print(f"[Aviso] Não foi possível gerenciar o Z-order do Windows: {e}")
 
 
-_GLOW_CACHE = {}
+_GLOW_CACHE = OrderedDict()
+_GLOW_CACHE_MAX = 256
 
 def draw_glow_circle(surface, color, pos, radius, glow=6):
-    """Desenha círculo com brilho neon ao redor usando cache de superfícies para alto desempenho."""
+    """Desenha círculo com brilho neon ao redor usando cache LRU de superfícies para alto desempenho."""
     radius = max(1, int(radius))
     glow = max(1, int(glow))
     color_rgb = (int(color[0]), int(color[1]), int(color[2]))
     
     cache_key = (color_rgb, radius, glow)
-    if cache_key not in _GLOW_CACHE:
+    if cache_key in _GLOW_CACHE:
+        _GLOW_CACHE.move_to_end(cache_key)
+    else:
         w = radius * 2 + glow * 2
         s = pygame.Surface((w, w), pygame.SRCALPHA)
         for g in range(glow, 0, -1):
@@ -131,20 +134,25 @@ def draw_glow_circle(surface, color, pos, radius, glow=6):
             pygame.draw.circle(s, (*color_rgb, alpha), (radius + glow, radius + glow), radius + g)
         pygame.draw.circle(s, color_rgb, (radius + glow, radius + glow), radius)
         _GLOW_CACHE[cache_key] = s
+        if len(_GLOW_CACHE) > _GLOW_CACHE_MAX:
+            _GLOW_CACHE.popitem(last=False)
     
     glow_surf = _GLOW_CACHE[cache_key]
     surface.blit(glow_surf, (pos[0] - radius - glow, pos[1] - radius - glow))
 
 
-_GLOW_RECT_CACHE = {}
+_GLOW_RECT_CACHE = OrderedDict()
+_GLOW_RECT_CACHE_MAX = 128
 
 def draw_glow_rect(surface, color, rect, glow=6, border_radius=12):
-    """Desenha um retângulo com brilho neon ao redor usando cache de superfícies para alto desempenho."""
+    """Desenha um retângulo com brilho neon ao redor usando cache LRU de superfícies para alto desempenho."""
     glow = max(1, int(glow))
     color_rgb = (int(color[0]), int(color[1]), int(color[2]))
     
     cache_key = (color_rgb, rect.width, rect.height, glow, border_radius)
-    if cache_key not in _GLOW_RECT_CACHE:
+    if cache_key in _GLOW_RECT_CACHE:
+        _GLOW_RECT_CACHE.move_to_end(cache_key)
+    else:
         w = rect.width + glow * 2
         h = rect.height + glow * 2
         s = pygame.Surface((w, h), pygame.SRCALPHA)
@@ -155,6 +163,8 @@ def draw_glow_rect(surface, color, rect, glow=6, border_radius=12):
                              border_radius=border_radius + g)
         pygame.draw.rect(s, color_rgb, (glow, glow, rect.width, rect.height), border_radius=border_radius)
         _GLOW_RECT_CACHE[cache_key] = s
+        if len(_GLOW_RECT_CACHE) > _GLOW_RECT_CACHE_MAX:
+            _GLOW_RECT_CACHE.popitem(last=False)
         
     glow_surf = _GLOW_RECT_CACHE[cache_key]
     surface.blit(glow_surf, (rect.x - glow, rect.y - glow))
@@ -164,6 +174,7 @@ def draw_glow_rect(surface, color, rect, glow=6, border_radius=12):
 _FRUIT_SURFACE_CACHE = {}
 _FRUIT_HALF_SURFACE_CACHE = {}
 _BOMB_FUSE_TIP = {}
+_BOMB_SPARK_CACHE = {}
 
 def get_fruit_surface(fruit_type, radius):
     key = (fruit_type, radius)
@@ -517,6 +528,8 @@ class Particle:
 _SYS_FONT_CACHE = {}
 
 def get_cached_sysfont(name, size, bold=False):
+    # Quantiza o tamanho para múltiplos de 2 para evitar crescimento ilimitado do cache
+    size = max(6, (int(size) + 1) & ~1)
     key = (name, size, bold)
     if key not in _SYS_FONT_CACHE:
         try:
@@ -528,16 +541,31 @@ def get_cached_sysfont(name, size, bold=False):
 
 # ─── Onomatopeias de Combate (Visual SFX) ────────────────────────────────────
 class VisualSFX:
+    # Etapas quantizadas de escala para pré-renderizar (elimina render/rotate por frame)
+    _SCALE_STEPS = [0.5, 0.8, 1.0, 1.3]
+
     def __init__(self, x, y, text, color, size=28):
         self.x, self.y = float(x), float(y)
-        self.text = text
-        self.color = color
-        self.size = size
-        self.angle = random.uniform(-15, 15)
         self.life = 1.0
         self.decay = 0.024  # Dura cerca de 42 frames (~0.7s)
         self.scale = 0.5
         self.vy = random.uniform(-2.5, -4.5)
+        self.angle = random.uniform(-15, 15)
+
+        # Pré-renderiza todas as etapas de escala de uma vez (shadow + main + rotação)
+        self._rendered = {}
+        for sc in self._SCALE_STEPS:
+            size_key = max(6, int(size * sc))
+            try:
+                font = get_cached_sysfont("Impact", size_key)
+            except Exception:
+                font = get_cached_sysfont("Arial", size_key, bold=True)
+            shadow = font.render(text, True, (0, 0, 0))
+            main = font.render(text, True, color)
+            if abs(self.angle) > 1:
+                shadow = pygame.transform.rotate(shadow, self.angle)
+                main = pygame.transform.rotate(main, self.angle)
+            self._rendered[sc] = (shadow, main)
 
     def update(self):
         self.y += self.vy
@@ -554,29 +582,22 @@ class VisualSFX:
             return
         alpha = int(255 * self.life)
         
-        size_key = max(6, int(self.size * self.scale))
-        # Usa fontes de impacto se disponíveis, senão Arial Negrito (usando o cache ultra-rápido)
-        try:
-            font = get_cached_sysfont("Impact", size_key)
-        except Exception:
-            font = get_cached_sysfont("Arial", size_key, bold=True)
-            
-        # Contorno preto para excelente contraste na câmera
-        shadow = font.render(self.text, True, (0, 0, 0))
-        main = font.render(self.text, True, self.color)
+        # Encontra a etapa de escala quantizada mais próxima
+        best_sc = min(self._SCALE_STEPS, key=lambda s: abs(s - self.scale))
+        shadow, main = self._rendered[best_sc]
         
+        # Apenas aplica alpha (operação ultra-leve)
         shadow.set_alpha(alpha)
         main.set_alpha(alpha)
-        
-        if abs(self.angle) > 1:
-            shadow = pygame.transform.rotate(shadow, self.angle)
-            main = pygame.transform.rotate(main, self.angle)
             
         w, h = main.get_size()
         pos = (int(self.x - w//2), int(self.y - h//2))
         surf.blit(shadow, (pos[0] + 3, pos[1] + 3))
         surf.blit(main, pos)
 
+
+_FRUIT_HALF_ROT_CACHE = OrderedDict()
+_FRUIT_HALF_ROT_CACHE_MAX = 512
 
 class FruitHalf:
     def __init__(self, fruit, direction):
@@ -602,8 +623,18 @@ class FruitHalf:
         return self.life > 0 and self.y < SCREEN_H + 150
 
     def draw(self, surf):
-        cached_surf = get_fruit_half_surface(self.fruit_type, self.r, self.side)
-        rotated_surf = pygame.transform.rotate(cached_surf, self.angle)
+        # Quantiza ângulo para múltiplos de 6° (60 valores em vez de 360 contínuos)
+        q_angle = round(self.angle / 6) * 6
+        rot_key = (self.fruit_type, self.r, self.side, q_angle)
+        if rot_key in _FRUIT_HALF_ROT_CACHE:
+            _FRUIT_HALF_ROT_CACHE.move_to_end(rot_key)
+            rotated_surf = _FRUIT_HALF_ROT_CACHE[rot_key]
+        else:
+            cached_surf = get_fruit_half_surface(self.fruit_type, self.r, self.side)
+            rotated_surf = pygame.transform.rotate(cached_surf, q_angle)
+            _FRUIT_HALF_ROT_CACHE[rot_key] = rotated_surf
+            if len(_FRUIT_HALF_ROT_CACHE) > _FRUIT_HALF_ROT_CACHE_MAX:
+                _FRUIT_HALF_ROT_CACHE.popitem(last=False)
         rw, rh = rotated_surf.get_size()
         surf.blit(rotated_surf, (int(self.x - rw//2), int(self.y - rh//2)))
 
@@ -674,12 +705,15 @@ class Fruit:
             ry = int(offset[0] * sin_a + offset[1] * cos_a)
             spark_x, spark_y = x + rx, y + ry
             
-            # Centelha de fogo pulsante na ponta do pavio
+            # Centelha de fogo pulsante na ponta do pavio (cache por pulse size)
             pulse = int(5 * (1.0 + 0.45 * math.sin(pygame.time.get_ticks() * 0.032)))
-            s = pygame.Surface((pulse*6, pulse*6), pygame.SRCALPHA)
-            pygame.draw.circle(s, (255, 100, 0, 80), (pulse*3, pulse*3), pulse*3)
-            pygame.draw.circle(s, (255, 220, 0, 160), (pulse*3, pulse*3), pulse*2)
-            surf.blit(s, (spark_x - pulse*3, spark_y - pulse*3))
+            if pulse not in _BOMB_SPARK_CACHE:
+                sz = pulse * 6
+                s = pygame.Surface((sz, sz), pygame.SRCALPHA)
+                pygame.draw.circle(s, (255, 100, 0, 80), (pulse*3, pulse*3), pulse*3)
+                pygame.draw.circle(s, (255, 220, 0, 160), (pulse*3, pulse*3), pulse*2)
+                _BOMB_SPARK_CACHE[pulse] = s
+            surf.blit(_BOMB_SPARK_CACHE[pulse], (spark_x - pulse*3, spark_y - pulse*3))
             
             # LED vermelho pulsante piscando no centro
             flash = int(128 + 127 * math.sin(pygame.time.get_ticks() * 0.016))
@@ -791,11 +825,13 @@ class FruitNinjaGame:
         self.btn_menu     = None
         
         # Atributos para o Ranking Online (Firebase)
-        self.player_name  = f"Jogador #{random.randint(100, 999)}"
+        self.player_name  = ""
+        self.waiting_for_name = True
         self.score_saved  = False
         self.score_uploading = False
-        self.save_status  = "ENVIANDO PONTUAÇÃO E FOTO... 📸"
+        self.save_status  = "DIGITE SEU NOME E PRESSIONE ENTER"
         self.btn_save     = None
+        self.chosen_photo = None
 
     def save_score_to_firebase(self, latest_frame=None):
         if self.score_saved or self.score_uploading or self.score == 0:
@@ -804,7 +840,8 @@ class FruitNinjaGame:
         self.score_uploading = True
         name = self.player_name.strip()
         if name == "":
-            name = "ANONIMO"
+            name = f"Ninja #{random.randint(100, 999)}"
+            self.player_name = name
             
         self.save_status = "ENVIANDO PONTUACAO..."
         
@@ -1049,6 +1086,8 @@ class FruitNinjaGame:
 
 
 # ─── Partículas de Menu (Seleção de Câmera) ──────────────────────────────────
+_MENU_PARTICLE_CACHE = {}
+
 class MenuParticle:
     """Representa uma partícula de poeira neon flutuante no menu de seleção."""
     def __init__(self):
@@ -1063,6 +1102,13 @@ class MenuParticle:
             (255, 220, 0, 120),   # Dourado/Laranja
             (56, 189, 248, 120)   # Azul claro
         ])
+        # Pré-renderiza a superfície uma única vez (elimina 35 allocs/frame)
+        cache_key = (self.r, self.color)
+        if cache_key not in _MENU_PARTICLE_CACHE:
+            s = pygame.Surface((self.r * 2, self.r * 2), pygame.SRCALPHA)
+            pygame.draw.circle(s, self.color, (self.r, self.r), self.r)
+            _MENU_PARTICLE_CACHE[cache_key] = s
+        self._surf = _MENU_PARTICLE_CACHE[cache_key]
         
     def update(self):
         self.x += self.vx
@@ -1072,9 +1118,7 @@ class MenuParticle:
             self.x = random.uniform(0, SCREEN_W)
             
     def draw(self, surf):
-        s = pygame.Surface((self.r * 2, self.r * 2), pygame.SRCALPHA)
-        pygame.draw.circle(s, self.color, (self.r, self.r), self.r)
-        surf.blit(s, (int(self.x - self.r), int(self.y - self.r)))
+        surf.blit(self._surf, (int(self.x - self.r), int(self.y - self.r)))
 
 
 # ─── Threads de Detecção e Pré-visualização de Câmera ────────────────────────
@@ -1769,10 +1813,18 @@ def draw_game_over(surf, fonts, game):
     # Desenha o fundo da caixa de entrada
     pygame.draw.rect(surf, (15, 20, 32), box_rect, border_radius=14)
     
-    # Define o status text e a cor da borda com base no status do Firebase
+    # Define o status text e a cor da borda com base no status do Firebase e da digitação
     if game.score == 0:
         status_text = "NENHUMA FRUTA FOI CORTADA"
         border_col = (90, 105, 120)
+    elif game.waiting_for_name:
+        status_text = "DIGITE SEU NOME E PRESSIONE ENTER"
+        # Borda pulsante neon azul-ciano em tempo real para WOW
+        pulse = int((math.sin(pygame.time.get_ticks() * 0.007) + 1) * 60) + 100
+        border_col = (0, pulse, 255)
+    elif not game.score_saved and game.save_status == "REGISTRO CANCELADO":
+        status_text = "REGISTRO CANCELADO 🛑"
+        border_col = (130, 130, 140)
     elif game.score_saved:
         status_text = "SALVO NO RANKING ONLINE! 🚀"
         border_col = (0, 230, 120)  # Verde se salvo
@@ -1780,7 +1832,7 @@ def draw_game_over(surf, fonts, game):
         status_text = "ERRO DE CONEXÃO AO SALVAR! ❌"
         border_col = (255, 60, 80)  # Vermelho se falhar
     else:
-        status_text = "ENVIANDO PONTUAÇÃO E FOTO... 📸"
+        status_text = game.save_status
         border_col = (255, 215, 0)  # Amarelo/Dourado se estiver enviando
         
     pygame.draw.rect(surf, border_col, box_rect, 2, border_radius=14)
@@ -1789,17 +1841,38 @@ def draw_game_over(surf, fonts, game):
     id_surf = fonts['small'].render("NINJA DETECTADO:", True, (150, 150, 160))
     surf.blit(id_surf, (box_x + 20, box_y + 16))
 
-    name_surf = fonts['title'].render(game.player_name, True, (255, 255, 255))
+    # Renderização de texto com placeholder esmaecido
+    if game.waiting_for_name and game.score > 0 and game.player_name == "":
+        name_surf = fonts['title'].render("Digite o nome do Ninja...", True, (100, 105, 120))
+    else:
+        disp_name = game.player_name if game.player_name != "" else "ANÔNIMO"
+        name_surf = fonts['title'].render(disp_name, True, (255, 255, 255))
+        
     surf.blit(name_surf, (box_x + 20, box_y + 42))
+
+    # Desenha o cursor piscante se estiver na fase de digitação
+    if game.waiting_for_name and game.score > 0:
+        if pygame.time.get_ticks() % 1000 < 500:
+            cursor_surf = fonts['title'].render("|", True, (0, 230, 255))
+            cursor_x = box_x + 20 + name_surf.get_width()
+            surf.blit(cursor_surf, (cursor_x, box_y + 42))
 
     # Rótulo de Status
     status_surf = fonts['label'].render(status_text, True, border_col)
     surf.blit(status_surf, (box_x + 20, box_y + 82))
 
-    # Dica de instrução
-    hint_txt = "Sua pontuação e foto foram enviadas automaticamente para o site!"
+    # Dica de instrução inteligente
     if game.score == 0:
         hint_txt = "Corte uma das frutas abaixo para iniciar uma nova partida!"
+    elif game.waiting_for_name:
+        hint_txt = "Pressione [ENTER] para Confirmar"
+    elif not game.score_saved and game.save_status == "REGISTRO CANCELADO":
+        hint_txt = "Registro cancelado. Fatie uma fruta abaixo para continuar!"
+    elif game.score_saved:
+        hint_txt = "Salvo com sucesso! Fatie uma fruta abaixo para continuar!"
+    else:
+        hint_txt = "Enviando pontuação..."
+        
     hint_surf = fonts['small'].render(hint_txt, True, (170, 195, 225))
     surf.blit(hint_surf, (SCREEN_W//2 - hint_surf.get_width()//2, box_y + box_h + 15))
 
@@ -1839,26 +1912,39 @@ def main():
             if event.type == pygame.QUIT:
                 running = False
             elif event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_ESCAPE:
-                    running = False
-                elif event.key in (pygame.K_f, pygame.K_F11):
-                    pygame.display.toggle_fullscreen()
-                    # Garante que a barra de tarefas no Windows suma definindo como TOPMOST se estiver em tela cheia
-                    flags = pygame.display.get_surface().get_flags()
-                    is_fs = bool(flags & pygame.FULLSCREEN)
-                    update_window_state(is_fs)
-                elif event.key in (pygame.K_RETURN, pygame.K_SPACE) and not game.started:
-                    tracker.start_snapshot = tracker.latest_frame.copy() if tracker.latest_frame is not None else None
-                    tracker.end_snapshot = None
-                    game.reset()
-                    game.started = True
-                elif event.key == pygame.K_r and game.game_over:
-                    tracker.start_snapshot = tracker.latest_frame.copy() if tracker.latest_frame is not None else None
-                    tracker.end_snapshot = None
-                    hs = game.high_score
-                    game.reset()
-                    game.high_score = hs
-                    game.started    = True
+                if game.game_over and game.waiting_for_name and game.score > 0:
+                    if event.key == pygame.K_BACKSPACE:
+                        game.player_name = game.player_name[:-1]
+                    elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                        game.waiting_for_name = False
+                        game.save_score_to_firebase(game.chosen_photo)
+                    elif event.key == pygame.K_ESCAPE:
+                        game.waiting_for_name = False
+                        game.save_status = "REGISTRO CANCELADO"
+                    elif event.unicode.isprintable() and event.unicode != "" and len(game.player_name) < 20:
+                        if event.unicode not in ('\r', '\n', '\t'):
+                            game.player_name += event.unicode
+                else:
+                    if event.key == pygame.K_ESCAPE:
+                        running = False
+                    elif event.key in (pygame.K_f, pygame.K_F11):
+                        pygame.display.toggle_fullscreen()
+                        # Garante que a barra de tarefas no Windows suma definindo como TOPMOST se estiver em tela cheia
+                        flags = pygame.display.get_surface().get_flags()
+                        is_fs = bool(flags & pygame.FULLSCREEN)
+                        update_window_state(is_fs)
+                    elif event.key in (pygame.K_RETURN, pygame.K_SPACE) and not game.started:
+                        tracker.start_snapshot = tracker.latest_frame.copy() if tracker.latest_frame is not None else None
+                        tracker.end_snapshot = None
+                        game.reset()
+                        game.started = True
+                    elif event.key == pygame.K_r and game.game_over:
+                        tracker.start_snapshot = tracker.latest_frame.copy() if tracker.latest_frame is not None else None
+                        tracker.end_snapshot = None
+                        hs = game.high_score
+                        game.reset()
+                        game.high_score = hs
+                        game.started    = True
             elif event.type == pygame.MOUSEBUTTONDOWN:
                 if not game.started:
                     tracker.start_snapshot = tracker.latest_frame.copy() if tracker.latest_frame is not None else None
@@ -1954,87 +2040,134 @@ def main():
                 if tracker.end_snapshot is None and tracker.latest_frame is not None:
                     tracker.end_snapshot = tracker.latest_frame.copy()
                 
-                # Auto save to firebase if not already uploading/saved and score > 0
-                if not game.score_saved and not game.score_uploading and game.score > 0:
-                    # Choose a random snapshot between start_snapshot and end_snapshot
+                # Se o score for 0, pula o registro de nome direto para as opções
+                if game.score == 0:
+                    game.waiting_for_name = False
+
+                # Escolhe e congela a foto na derrota caso ainda não tenha sido escolhida e o score > 0
+                if game.chosen_photo is None and game.score > 0:
                     photos = []
                     if tracker.start_snapshot is not None:
                         photos.append(tracker.start_snapshot)
                     if tracker.end_snapshot is not None:
                         photos.append(tracker.end_snapshot)
                     
-                    chosen_frame = None
                     if photos:
-                        chosen_frame = random.choice(photos)
+                        game.chosen_photo = random.choice(photos)
                     elif tracker.latest_frame is not None:
-                        chosen_frame = tracker.latest_frame
-                        
-                    game.save_score_to_firebase(chosen_frame)
+                        game.chosen_photo = tracker.latest_frame.copy()
 
-                # Desenha o menu interativo de Game Over por gestos
+                # Desenha o menu interativo de Game Over (inclui a caixa de nome se waiting_for_name for True)
                 draw_game_over(screen, fonts, game)
                 
-                # Layout fixo com 2 botões: REINICIAR (Morango) e MENU (Limão)
-                game.btn_save = None
-                target_re_x = SCREEN_W // 2 - 180
-                target_me_x = SCREEN_W // 2 + 180
-                target_y = 570
-                
-                if game.btn_restart is None:
-                    game.btn_restart = Fruit(is_bomb=False)
-                    game.btn_restart.fruit_type = 'morango'
-                    game.btn_restart.x = target_re_x
-                    game.btn_restart.y = target_y
-                    game.btn_restart.radius = 48
-                    game.btn_restart.rot_speed = 3.0
-                else:
-                    # Interpolação suave para nova posição
-                    game.btn_restart.x = int(game.btn_restart.x * 0.88 + target_re_x * 0.12)
-                    game.btn_restart.y = int(game.btn_restart.y * 0.88 + target_y * 0.12)
+                # Só desenha e interage com as frutas dos botões após a digitação/registro do nome
+                if not game.waiting_for_name:
+                    # Layout fixo com 2 botões: REINICIAR (Morango) e MENU (Limão)
+                    game.btn_save = None
+                    target_re_x = SCREEN_W // 2 - 180
+                    target_me_x = SCREEN_W // 2 + 180
+                    target_y = 570
                     
-                if game.btn_menu is None:
-                    game.btn_menu = Fruit(is_bomb=False)
-                    game.btn_menu.fruit_type = 'limao'
-                    game.btn_menu.x = target_me_x
-                    game.btn_menu.y = target_y
-                    game.btn_menu.radius = 48
-                    game.btn_menu.rot_speed = -2.5
-                else:
-                    # Interpolação suave para nova posição
-                    game.btn_menu.x = int(game.btn_menu.x * 0.88 + target_me_x * 0.12)
-                    game.btn_menu.y = int(game.btn_menu.y * 0.88 + target_y * 0.12)
+                    if game.btn_restart is None:
+                        game.btn_restart = Fruit(is_bomb=False)
+                        game.btn_restart.fruit_type = 'morango'
+                        game.btn_restart.x = target_re_x
+                        game.btn_restart.y = target_y
+                        game.btn_restart.radius = 48
+                        game.btn_restart.rot_speed = 3.0
+                    else:
+                        # Interpolação suave para nova posição
+                        game.btn_restart.x = int(game.btn_restart.x * 0.88 + target_re_x * 0.12)
+                        game.btn_restart.y = int(game.btn_restart.y * 0.88 + target_y * 0.12)
+                        
+                    if game.btn_menu is None:
+                        game.btn_menu = Fruit(is_bomb=False)
+                        game.btn_menu.fruit_type = 'limao'
+                        game.btn_menu.x = target_me_x
+                        game.btn_menu.y = target_y
+                        game.btn_menu.radius = 48
+                        game.btn_menu.rot_speed = -2.5
+                    else:
+                        # Interpolação suave para nova posição
+                        game.btn_menu.x = int(game.btn_menu.x * 0.88 + target_me_x * 0.12)
+                        game.btn_menu.y = int(game.btn_menu.y * 0.88 + target_y * 0.12)
 
-                # Atualiza os ângulos das frutas dos botões
-                if game.btn_restart:
-                    game.btn_restart.angle += game.btn_restart.rot_speed
-                if game.btn_menu:
-                    game.btn_menu.angle += game.btn_menu.rot_speed
+                    # Atualiza os ângulos das frutas dos botões
+                    if game.btn_restart:
+                        game.btn_restart.angle += game.btn_restart.rot_speed
+                    if game.btn_menu:
+                        game.btn_menu.angle += game.btn_menu.rot_speed
 
-                # Desenha círculos com brilho neon ao redor das frutas de opção
-                if game.btn_restart:
-                    pulse_re = 5 + int(math.sin(pygame.time.get_ticks() * 0.008) * 3)
-                    draw_glow_circle(screen, (220, 25, 55), (int(game.btn_restart.x), int(game.btn_restart.y)), game.btn_restart.radius + 2, glow=pulse_re)
-                
-                if game.btn_menu:
-                    pulse_me = 5 + int(math.sin(pygame.time.get_ticks() * 0.008 + 2) * 3)
-                    draw_glow_circle(screen, (200, 220, 20), (int(game.btn_menu.x), int(game.btn_menu.y)), game.btn_menu.radius + 2, glow=pulse_me)
+                    # Desenha círculos com brilho neon ao redor das frutas de opção
+                    if game.btn_restart:
+                        pulse_re = 5 + int(math.sin(pygame.time.get_ticks() * 0.008) * 3)
+                        draw_glow_circle(screen, (220, 25, 55), (int(game.btn_restart.x), int(game.btn_restart.y)), game.btn_restart.radius + 2, glow=pulse_re)
+                    
+                    if game.btn_menu:
+                        pulse_me = 5 + int(math.sin(pygame.time.get_ticks() * 0.008 + 2) * 3)
+                        draw_glow_circle(screen, (200, 220, 20), (int(game.btn_menu.x), int(game.btn_menu.y)), game.btn_menu.radius + 2, glow=pulse_me)
 
-                # Desenha as frutas dos botões
-                if game.btn_restart:
-                    game.btn_restart.draw(screen)
-                if game.btn_menu:
-                    game.btn_menu.draw(screen)
+                    # Desenha as frutas dos botões
+                    if game.btn_restart:
+                        game.btn_restart.draw(screen)
+                    if game.btn_menu:
+                        game.btn_menu.draw(screen)
 
-                # Rótulos de instrução sob as frutas
-                if game.btn_restart:
-                    lbl_re = get_restart_label(fonts['small'])
-                    screen.blit(lbl_re, (game.btn_restart.x - lbl_re.get_width()//2, game.btn_restart.y + 55))
-                
-                if game.btn_menu:
-                    lbl_me = get_menu_label(fonts['small'])
-                    screen.blit(lbl_me, (game.btn_menu.x - lbl_me.get_width()//2, game.btn_menu.y + 55))
+                    # Rótulos de instrução sob as frutas
+                    if game.btn_restart:
+                        lbl_re = get_restart_label(fonts['small'])
+                        screen.blit(lbl_re, (game.btn_restart.x - lbl_re.get_width()//2, game.btn_restart.y + 55))
+                    
+                    if game.btn_menu:
+                        lbl_me = get_menu_label(fonts['small'])
+                        screen.blit(lbl_me, (game.btn_menu.x - lbl_me.get_width()//2, game.btn_menu.y + 55))
 
-                # Atualiza e desenha partículas do menu se houverem
+                    # Verifica se o jogador fatiou alguma das opções por gestos
+                    if tip and trail.velocity() >= SLICE_VEL_MIN:
+                        for seg_a, seg_b in trail.segments():
+                            # Opção 1: REINICIAR (Morango)
+                            if game.btn_restart and seg_circle_hit(seg_a, seg_b, (game.btn_restart.x, game.btn_restart.y), game.btn_restart.radius):
+                                game.halves.append(FruitHalf(game.btn_restart, +1))
+                                game.halves.append(FruitHalf(game.btn_restart, -1))
+                                info = FRUIT_TYPES[game.btn_restart.fruit_type]
+                                for _ in range(25):
+                                    game.particles.append(Particle(game.btn_restart.x, game.btn_restart.y, info['inner']))
+                                for _ in range(10):
+                                    game.particles.append(Particle(game.btn_restart.x, game.btn_restart.y, info['color']))
+                                
+                                tracker.start_snapshot = tracker.latest_frame.copy() if tracker.latest_frame is not None else None
+                                tracker.end_snapshot = None
+                                hs = game.high_score
+                                game.reset()
+                                game.high_score = hs
+                                game.started = True
+                                game.btn_restart = None
+                                game.btn_save = None
+                                game.btn_menu = None
+                                break
+                            
+                            # Opção 2: VOLTAR AO MENU (Limão)
+                            elif game.btn_menu and seg_circle_hit(seg_a, seg_b, (game.btn_menu.x, game.btn_menu.y), game.btn_menu.radius):
+                                game.halves.append(FruitHalf(game.btn_menu, +1))
+                                game.halves.append(FruitHalf(game.btn_menu, -1))
+                                info = FRUIT_TYPES[game.btn_menu.fruit_type]
+                                for _ in range(25):
+                                    game.particles.append(Particle(game.btn_menu.x, game.btn_menu.y, info['inner']))
+                                for _ in range(10):
+                                    game.particles.append(Particle(game.btn_menu.x, game.btn_menu.y, info['color']))
+                                
+                                tracker.start_snapshot = tracker.latest_frame.copy() if tracker.latest_frame is not None else None
+                                tracker.end_snapshot = None
+                                hs = game.high_score
+                                game.reset()
+                                game.high_score = hs
+                                game.started = False
+                                game.btn_restart = None
+                                game.btn_save = None
+                                game.btn_menu = None
+                                break
+
+                # Atualiza e desenha partículas do menu se houverem (mantido ativo em ambas as fases para dinamismo)
                 if game.halves or game.particles:
                     game.halves = [h for h in game.halves if h.update()]
                     game.particles = [p for p in game.particles if p.update()]
@@ -2043,53 +2176,8 @@ def main():
                     for p in game.particles:
                         p.draw(screen)
 
-                # Desenha o rastro do dedo por cima do Game Over para guiar o corte
+                # Desenha o rastro do dedo por cima do Game Over para guiar o corte (ativo em ambas as fases)
                 trail.draw(screen)
-
-                # Verifica se o jogador fatiou alguma das opções por gestos
-                if tip and trail.velocity() >= SLICE_VEL_MIN:
-                    for seg_a, seg_b in trail.segments():
-                        # Opção 1: REINICIAR (Morango)
-                        if game.btn_restart and seg_circle_hit(seg_a, seg_b, (game.btn_restart.x, game.btn_restart.y), game.btn_restart.radius):
-                            game.halves.append(FruitHalf(game.btn_restart, +1))
-                            game.halves.append(FruitHalf(game.btn_restart, -1))
-                            info = FRUIT_TYPES[game.btn_restart.fruit_type]
-                            for _ in range(25):
-                                game.particles.append(Particle(game.btn_restart.x, game.btn_restart.y, info['inner']))
-                            for _ in range(10):
-                                game.particles.append(Particle(game.btn_restart.x, game.btn_restart.y, info['color']))
-                            
-                            tracker.start_snapshot = tracker.latest_frame.copy() if tracker.latest_frame is not None else None
-                            tracker.end_snapshot = None
-                            hs = game.high_score
-                            game.reset()
-                            game.high_score = hs
-                            game.started = True
-                            game.btn_restart = None
-                            game.btn_save = None
-                            game.btn_menu = None
-                            break
-                        
-                        # Opção 2: VOLTAR AO MENU (Limão)
-                        elif game.btn_menu and seg_circle_hit(seg_a, seg_b, (game.btn_menu.x, game.btn_menu.y), game.btn_menu.radius):
-                            game.halves.append(FruitHalf(game.btn_menu, +1))
-                            game.halves.append(FruitHalf(game.btn_menu, -1))
-                            info = FRUIT_TYPES[game.btn_menu.fruit_type]
-                            for _ in range(25):
-                                game.particles.append(Particle(game.btn_menu.x, game.btn_menu.y, info['inner']))
-                            for _ in range(10):
-                                game.particles.append(Particle(game.btn_menu.x, game.btn_menu.y, info['color']))
-                            
-                            tracker.start_snapshot = tracker.latest_frame.copy() if tracker.latest_frame is not None else None
-                            tracker.end_snapshot = None
-                            hs = game.high_score
-                            game.reset()
-                            game.high_score = hs
-                            game.started = False
-                            game.btn_restart = None
-                            game.btn_save = None
-                            game.btn_menu = None
-                            break
 
         pygame.display.flip()
 
