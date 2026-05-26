@@ -91,6 +91,29 @@ def lerp_col(c1, c2, t):
     return tuple(max(0, min(255, int(c1[i] + (c2[i]-c1[i])*t))) for i in range(3))
 
 
+def update_window_state(fullscreen):
+    """Garante que no Windows a janela receba foco real e seja configurada como TOPMOST
+    quando em tela cheia para cobrir e esconder a barra de tarefas do Windows.
+    """
+    if os.name != 'nt':
+        return
+    try:
+        import ctypes
+        hwnd = pygame.display.get_hwnd()
+        if hwnd:
+            # HWND_TOPMOST = -1, HWND_NOTOPMOST = -2
+            hwnd_insert_after = -1 if fullscreen else -2
+            # SWP_NOSIZE = 0x0001, SWP_NOMOVE = 0x0002, SWP_SHOWWINDOW = 0x0040
+            flags = 0x0001 | 0x0002 | 0x0040
+            
+            # Traz a janela para a frente e dá foco real
+            ctypes.windll.user32.SetForegroundWindow(hwnd)
+            ctypes.windll.user32.SetActiveWindow(hwnd)
+            ctypes.windll.user32.SetWindowPos(hwnd, hwnd_insert_after, 0, 0, 0, 0, flags)
+    except Exception as e:
+        print(f"[Aviso] Não foi possível gerenciar o Z-order do Windows: {e}")
+
+
 _GLOW_CACHE = {}
 
 def draw_glow_circle(surface, color, pos, radius, glow=6):
@@ -1789,6 +1812,7 @@ def main():
 
     screen = pygame.display.set_mode((SCREEN_W, SCREEN_H))
     pygame.display.set_caption("Fruit Ninja Vision AI 🍉")
+    update_window_state(False)  # Inicializa o z-order de forma limpa
     clock  = pygame.time.Clock()
     fonts  = make_fonts()
 
@@ -1819,6 +1843,10 @@ def main():
                     running = False
                 elif event.key in (pygame.K_f, pygame.K_F11):
                     pygame.display.toggle_fullscreen()
+                    # Garante que a barra de tarefas no Windows suma definindo como TOPMOST se estiver em tela cheia
+                    flags = pygame.display.get_surface().get_flags()
+                    is_fs = bool(flags & pygame.FULLSCREEN)
+                    update_window_state(is_fs)
                 elif event.key in (pygame.K_RETURN, pygame.K_SPACE) and not game.started:
                     tracker.start_snapshot = tracker.latest_frame.copy() if tracker.latest_frame is not None else None
                     tracker.end_snapshot = None
@@ -1837,6 +1865,12 @@ def main():
                     tracker.end_snapshot = None
                     game.reset()
                     game.started = True
+            elif event.type == pygame.ACTIVEEVENT:
+                # Quando a janela recupera o foco (ex: Alt+Tab de volta ao jogo)
+                if event.gain == 1:
+                    flags = pygame.display.get_surface().get_flags()
+                    is_fs = bool(flags & pygame.FULLSCREEN)
+                    update_window_state(is_fs)
 
         # ── Câmera + rastreamento ────────────────────────────────────────
         bg, tip = tracker.get_frame_and_tip()
