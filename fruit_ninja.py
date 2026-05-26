@@ -27,7 +27,7 @@ import pygame
 
 # ─── Constantes ────────────────────────────────────────────────────────────
 SCREEN_W, SCREEN_H = 1280, 720
-FPS = 60
+FPS = 30
 MODEL_PATH = os.path.join(os.path.dirname(__file__), "hand_landmarker.task")
 
 FRUIT_TYPES = {
@@ -40,7 +40,7 @@ FRUIT_TYPES = {
     'abacaxi':  {'color': (220, 180, 10),  'inner': (255, 215, 60),  'seed': None},
 }
 
-GRAVITY        = 0.44
+GRAVITY        = 0.67
 INITIAL_LIVES  = 3
 TRAIL_LEN      = 20
 SLICE_VEL_MIN  = 6   # px/frame mínimo para cortar
@@ -733,6 +733,7 @@ class FruitNinjaGame:
         self.combo        = 0
         self.combo_timer  = 0
         self.combo_disp   = ComboDisplay()
+        self.streak       = 0   # Sequência de cortes consecutivos sem errar
         self.spawn_timer  = 60
         self.started      = False
         self.game_over    = False
@@ -857,6 +858,7 @@ class FruitNinjaGame:
         if missed:
             self.lives = max(0, self.lives - missed)
             self.combo = 0
+            self.streak = 0   # Sequência quebrada ao perder uma fruta
             if self.lives == 0:
                 self.game_over = True
                 self.high_score = max(self.high_score, self.score)
@@ -909,7 +911,8 @@ class FruitNinjaGame:
 
         self.combo += 1
         self.combo_timer = 50
-        pts = 10 * max(1, self.combo)
+        self.streak += 1   # Incrementa a sequência consecutiva
+        pts = max(1, self.streak)   # Pontos = número da sequência atual
         self.score += pts
         self.sliced_total += 1
 
@@ -917,6 +920,10 @@ class FruitNinjaGame:
             self.combo_disp.trigger(self.combo)
 
         info = FRUIT_TYPES[f.fruit_type]
+
+        # Exibe o valor dos pontos e a sequência no local do corte
+        pts_color = (255, 215, 0) if self.streak < 5 else (255, 140, 0) if self.streak < 10 else (255, 50, 200)
+        self.sfx.append(VisualSFX(f.x, f.y - 20, f"+{pts}", pts_color, size=28))
 
         # Chance de spawnar onomatopeias comuns (SPLASH, SLASH, CHOP, SLICED)
         if random.random() < 0.40:
@@ -926,7 +933,7 @@ class FruitNinjaGame:
         if self.combo >= 2:
             self.combo_disp.trigger(self.combo)
             combo_word = f"COMBO ×{self.combo}!" if self.combo < 4 else f"NINJA ×{self.combo}!"
-            self.sfx.append(VisualSFX(f.x, f.y - 30, combo_word, (255, 215, 0), size=32))
+            self.sfx.append(VisualSFX(f.x, f.y - 50, combo_word, (255, 215, 0), size=32))
 
         self.halves.append(FruitHalf(f, +1))
         self.halves.append(FruitHalf(f, -1))
@@ -985,10 +992,18 @@ class FruitNinjaGame:
             
         surf.blit(self._level_surf, (SCREEN_W//2 - self._level_surf.get_width()//2, 24))
 
+        # Sequência (Streak) — exibe ao lado do score quando > 0
+        if self.streak > 0:
+            streak_col = (255, 215, 0) if self.streak < 5 else (255, 140, 0) if self.streak < 10 else (255, 50, 200)
+            if not hasattr(self, '_streak_val') or self._streak_val != self.streak:
+                self._streak_val = self.streak
+                self._streak_surf = fonts['label'].render(f"🔥 SEQÜENCIA  {self.streak}x", True, streak_col)
+            surf.blit(self._streak_surf, (SCREEN_W - self._streak_surf.get_width() - 18, 76))
+
 
 # ─── Hand tracker ───────────────────────────────────────────────────────────
 class HandTracker:
-    def __init__(self, model_path):
+    def __init__(self, model_path=None):
         self.available = False
         self.cap = None
         self.landmarker = None
@@ -1011,6 +1026,9 @@ class HandTracker:
         self.running = False
         self.thread = None
 
+        if model_path is None:
+            model_path = os.path.join(os.path.dirname(__file__), "hand_landmarker.task")
+
         if not os.path.exists(model_path):
             print(f"[AVISO] Modelo não encontrado: {model_path}")
             return
@@ -1020,22 +1038,22 @@ class HandTracker:
         HLO = mp.tasks.vision.HandLandmarkerOptions
         RM = mp.tasks.vision.RunningMode
 
-        with open(model_path, 'rb') as fh:
-            model_bytes = fh.read()
-
-        # Otimizado: Thresholds ligeiramente mais tolerantes a desfoques de alta velocidade (motion blur)
-        opts = HLO(
-            base_options=BaseOptions(model_asset_buffer=model_bytes),
-            running_mode=RM.VIDEO,
-            num_hands=1,
-            min_hand_detection_confidence=0.45,
-            min_hand_presence_confidence=0.40,
-            min_tracking_confidence=0.40,
-        )
         try:
+            with open(model_path, 'rb') as fh:
+                model_bytes = fh.read()
+
+            # Otimizado: Thresholds ligeiramente mais tolerantes a desfoques de alta velocidade (motion blur)
+            opts = HLO(
+                base_options=BaseOptions(model_asset_buffer=model_bytes),
+                running_mode=RM.VIDEO,
+                num_hands=1,
+                min_hand_detection_confidence=0.45,
+                min_hand_presence_confidence=0.40,
+                min_tracking_confidence=0.40,
+            )
             self.landmarker = HL.create_from_options(opts)
         except Exception as e:
-            print(f"[AVISO] HandLandmarker falhou: {e}")
+            print(f"[AVISO] HandLandmarker falhou ao inicializar: {e}")
             return
 
         self.cap = cv2.VideoCapture(0)
@@ -1067,37 +1085,9 @@ class HandTracker:
         with self.lock:
             self._latest_frame = val
 
-    def _is_valid_hand(self, lm):
-        # Mão para o Fruit Ninja: Checa a estrutura rígida da palma em 3D para suportar rotações
-        def dist_3d(a, b):
-            return math.sqrt((a.x - b.x)**2 + (a.y - b.y)**2 + (a.z - b.z)**2)
-            
-        wrist = lm[0]
-        idx_k = lm[5]
-        pin_k = lm[17]
-        plen = dist_3d(idx_k, wrist)
-        pw   = dist_3d(pin_k, idx_k)
-        
-        # Mão saudável tem proporções de palma válidas e tamanho mínimo tridimensional
-        if plen < 0.012 or pw < 0.004:
-            return False
-        ratio = plen / max(pw, 0.001)
-        return 0.1 <= ratio <= 10.0
-
-    def _is_pointing_finger(self, lm):
-        def dist_3d(a, b):
-            return math.sqrt((a.x - b.x)**2 + (a.y - b.y)**2 + (a.z - b.z)**2)
-        
-        # Indicador (5=MCP, 6=PIP, 8=Tip)
-        idx_base = dist_3d(lm[6], lm[5])
-        idx_tip  = dist_3d(lm[8], lm[5])
-        
-        # O indicador deve estar estendido (distância ponta-nódulo > 1.15x o osso base)
-        return idx_tip > idx_base * 1.15
-
     def _thread_loop(self):
         while self.running:
-            if not self.available or self.cap is None:
+            if not self.available or self.cap is None or self.landmarker is None:
                 time.sleep(0.03)
                 continue
 
@@ -1132,53 +1122,37 @@ class HandTracker:
             tip = None
             if results and results.hand_landmarks:
                 lm = results.hand_landmarks[0]
-                if self._is_valid_hand(lm) and self._is_pointing_finger(lm):
-                    t8 = lm[8]
-                    raw_x = int(t8.x * SCREEN_W)
-                    raw_y = int(t8.y * SCREEN_H)
-                    
-                    # Suavização exponencial thread-safe (peso aprimorado de 75% raw para corte cirúrgico e instantâneo)
-                    with self.lock:
-                        if self.prev_x is None:
-                            self.prev_x, self.prev_y = raw_x, raw_y
-                            self.vx, self.vy = 0.0, 0.0
-                        else:
-                            # Calcula velocidade instantânea no frame
-                            curr_vx = raw_x - self.prev_x
-                            curr_vy = raw_y - self.prev_y
-                            # Suaviza o vetor de velocidade (60% da velocidade atual)
-                            self.vx = self.vx * 0.4 + curr_vx * 0.6
-                            self.vy = self.vy * 0.4 + curr_vy * 0.6
-                            
-                            self.prev_x = int(self.prev_x * 0.25 + raw_x * 0.75)
-                            self.prev_y = int(self.prev_y * 0.25 + raw_y * 0.75)
+                
+                # Pega diretamente a ponta do indicador (Landmark 8) sem filtros rígidos e restritivos
+                t8 = lm[8]
+                raw_x = int(t8.x * SCREEN_W)
+                raw_y = int(t8.y * SCREEN_H)
+                
+                # Suavização exponencial thread-safe (peso aprimorado de 75% raw para corte cirúrgico e instantâneo)
+                with self.lock:
+                    if self.prev_x is None:
+                        self.prev_x, self.prev_y = raw_x, raw_y
+                        self.vx, self.vy = 0.0, 0.0
+                    else:
+                        # Calcula velocidade instantânea no frame
+                        curr_vx = raw_x - self.prev_x
+                        curr_vy = raw_y - self.prev_y
+                        # Suaviza o vetor de velocidade (60% da velocidade atual)
+                        self.vx = self.vx * 0.4 + curr_vx * 0.6
+                        self.vy = self.vy * 0.4 + curr_vy * 0.6
                         
-                        tip = (self.prev_x, self.prev_y)
-                        self.points_queue.append(tip)
-                        self.consecutive_lost = 0
+                        self.prev_x = int(self.prev_x * 0.25 + raw_x * 0.75)
+                        self.prev_y = int(self.prev_y * 0.25 + raw_y * 0.75)
                     
-                    # Desenha o indicador visual da ponta do dedo de forma proporcional no frame 640x360
-                    tx_frame = int(t8.x * 640)
-                    ty_frame = int(t8.y * 360)
-                    cv2.circle(frame, (tx_frame, ty_frame), 8, (0, 220, 200), -1)
-                    cv2.circle(frame, (tx_frame, ty_frame), 10, (255, 255, 255), 2)
-                else:
-                    # Mão detectada mas não passou nas condições geométricas (ex: de lado ou parcialmente oclusa)
-                    with self.lock:
-                        self.consecutive_lost += 1
-                        # Previsão Inercial: se a velocidade era alta, projeta a lâmina na mesma direção
-                        if self.consecutive_lost <= 4 and self.prev_x is not None and (abs(self.vx) > 3 or abs(self.vy) > 3):
-                            self.prev_x = int(self.prev_x + self.vx)
-                            self.prev_y = int(self.prev_y + self.vy)
-                            self.vx *= 0.82
-                            self.vy *= 0.82
-                            tip = (self.prev_x, self.prev_y)
-                            self.points_queue.append(tip)
-                        else:
-                            self.prev_x = None
-                            self.prev_y = None
-                            self.vx = 0.0
-                            self.vy = 0.0
+                    tip = (self.prev_x, self.prev_y)
+                    self.points_queue.append(tip)
+                    self.consecutive_lost = 0
+                
+                # Desenha o indicador visual da ponta do dedo de forma proporcional no frame 640x360
+                tx_frame = int(t8.x * 640)
+                ty_frame = int(t8.y * 360)
+                cv2.circle(frame, (tx_frame, ty_frame), 8, (0, 220, 200), -1)
+                cv2.circle(frame, (tx_frame, ty_frame), 10, (255, 255, 255), 2)
             else:
                 # Perda total do tracking (câmera borrada pelo movimento rápido)
                 with self.lock:
@@ -1201,7 +1175,7 @@ class HandTracker:
             disp = cv2.resize(frame, (SCREEN_W, SCREEN_H), interpolation=cv2.INTER_LINEAR)
             rgb_disp = cv2.cvtColor(disp, cv2.COLOR_BGR2RGB)
             
-            # Converter a imagem em superfície do Pygame na thread secundária sem duplicar memória e já convertida para o display nativo
+            # Converter a imagem em superfície do Pygame na thread secundária
             surf = pygame.image.frombuffer(rgb_disp, (SCREEN_W, SCREEN_H), 'RGB').convert()
 
             with self.lock:
