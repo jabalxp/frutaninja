@@ -35,35 +35,53 @@ O clássico jogo de empilhar blocos controlado inteiramente pela posição e for
 
 ## 🚀 Tecnologias Utilizadas
 
-O ecossistema roda inteiramente local em **Python**, sem requisições na nuvem:
-*   **Pygame**: Renderização de tela, motor de física para frutas fatiadas, sistemas de partículas cintilantes de suco e renderização neon.
-*   **OpenCV (cv2)**: Inicialização rápida de câmera, processamento de imagem em tempo real e espelhamento horizontal intuitivo.
-*   **MediaPipe**: Framework de inteligência artificial do Google para detecção de 21 landmarks tridimensionais das mãos com altíssima taxa de quadros e precisão.
-*   **NumPy**: Processamento veloz das matrizes de imagem.
+O ecossistema roda inteiramente local em **Python**, sem necessidade de processamento na nuvem:
+*   **Pygame-CE (Community Edition)**: Motor de renderização ultra-veloz, manipulação de superfícies em tempo real, física de partículas para o suco das frutas e brilho neon premium. *(Recomendado no lugar do Pygame clássico para compatibilidade total com Python moderno)*.
+*   **OpenCV (cv2)**: Captura e inicialização assíncrona de webcams, processamento rápido de frames de vídeo e espelhamento horizontal intuitivo.
+*   **MediaPipe (Google AI)**: Framework de inteligência artificial de alta performance para detecção e rastreamento tridimensional dos 21 landmarks das mãos em tempo real.
+*   **NumPy**: Processamento matemático acelerado de matrizes de imagem.
 
 ---
 
-## 💻 Instalação e Execução
+## 💻 Instalação e Configuração
+
+Siga os passos abaixo para preparar o seu ambiente e rodar os jogos com desempenho máximo.
 
 ### 1. Pré-requisitos
-Certifique-se de possuir o **Python 3.8 a 3.14** instalado.
+*   **Python**: Versões **3.8 a 3.14** instaladas.
+*   **Hardware**: Uma Webcam conectada e ambiente com iluminação adequada para o rastreamento da IA.
 
-### 2. Instalação das Dependências
-Abra o prompt de comando (CMD) ou PowerShell na pasta raiz do projeto e execute:
+### 2. Instalação das Bibliotecas
+Abra o seu terminal (Prompt de Comando/CMD ou PowerShell no Windows, ou Terminal no Linux/macOS) na pasta raiz deste projeto e execute o comando abaixo para instalar todas as dependências recomendadas:
 
 ```bash
-pip install pygame opencv-python mediapipe numpy
+pip install pygame-ce opencv-python mediapipe numpy
 ```
 
-*(Caso utilize o Python 3.14+, execute também o patch incluído: `python patch_mediapipe.py`)*
+> [!TIP]
+> **Por que Pygame-CE?**
+> O *Pygame Community Edition* (pygame-ce) traz melhorias massivas de performance, correções de bugs ativos e suporte completo para as versões mais novas do Python (como Python 3.12, 3.13 e 3.14), onde o Pygame padrão frequentemente falha ao compilar ou renderizar no Windows.
 
-### 3. Jogando
+### 3. Aplicando o Patch do MediaPipe (Crucial para Windows & Python 3.12+)
+No Windows, devido a mudanças internas de compilação da DLL do MediaPipe, pode ocorrer um erro crítico ao tentar inicializar o rastreamento de mãos (`AttributeError: _shared_lib.free.argtypes`).
 
-*   Para jogar o **Fruit Ninja**:
+Para resolver isso de forma 100% automática, execute o script de patch portátil incluído no projeto:
+
+```bash
+python patch_mediapipe.py
+```
+
+*Este script localiza dinamicamente o arquivo de bindings do MediaPipe instalado no seu ambiente Python e aplica uma correção de compatibilidade robusta.*
+
+### 4. Executando os Jogos
+
+Com as dependências instaladas e o patch aplicado, você está pronto para iniciar:
+
+*   **Para jogar o Fruit Ninja Vision AI 🍉**:
     ```bash
     python fruit_ninja.py
     ```
-*   Para jogar o **Tetris**:
+*   **Para jogar o Tetris Vision AI 🧱**:
     ```bash
     python main.py
     ```
