@@ -113,6 +113,30 @@ def draw_glow_circle(surface, color, pos, radius, glow=6):
     surface.blit(glow_surf, (pos[0] - radius - glow, pos[1] - radius - glow))
 
 
+_GLOW_RECT_CACHE = {}
+
+def draw_glow_rect(surface, color, rect, glow=6, border_radius=12):
+    """Desenha um retângulo com brilho neon ao redor usando cache de superfícies para alto desempenho."""
+    glow = max(1, int(glow))
+    color_rgb = (int(color[0]), int(color[1]), int(color[2]))
+    
+    cache_key = (color_rgb, rect.width, rect.height, glow, border_radius)
+    if cache_key not in _GLOW_RECT_CACHE:
+        w = rect.width + glow * 2
+        h = rect.height + glow * 2
+        s = pygame.Surface((w, h), pygame.SRCALPHA)
+        for g in range(glow, 0, -1):
+            alpha = int(90 * (1 - g / glow))
+            pygame.draw.rect(s, (*color_rgb, alpha), 
+                             (glow - g, glow - g, rect.width + g * 2, rect.height + g * 2), 
+                             border_radius=border_radius + g)
+        pygame.draw.rect(s, color_rgb, (glow, glow, rect.width, rect.height), border_radius=border_radius)
+        _GLOW_RECT_CACHE[cache_key] = s
+        
+    glow_surf = _GLOW_RECT_CACHE[cache_key]
+    surface.blit(glow_surf, (rect.x - glow, rect.y - glow))
+
+
 # ─── Caches de Performance e Gráficos pré-renderizados ───────────────────────
 _FRUIT_SURFACE_CACHE = {}
 _FRUIT_HALF_SURFACE_CACHE = {}
@@ -1001,9 +1025,410 @@ class FruitNinjaGame:
             surf.blit(self._streak_surf, (SCREEN_W - self._streak_surf.get_width() - 18, 76))
 
 
+# ─── Partículas de Menu (Seleção de Câmera) ──────────────────────────────────
+class MenuParticle:
+    """Representa uma partícula de poeira neon flutuante no menu de seleção."""
+    def __init__(self):
+        self.x = random.uniform(0, SCREEN_W)
+        self.y = random.uniform(0, SCREEN_H)
+        self.vx = random.uniform(-0.5, 0.5)
+        self.vy = random.uniform(-0.3, -1.2)
+        self.r = random.randint(2, 6)
+        self.color = random.choice([
+            (0, 230, 255, 120),  # Ciano
+            (255, 50, 100, 120),  # Rosa/Neon melancia
+            (255, 220, 0, 120),   # Dourado/Laranja
+            (56, 189, 248, 120)   # Azul claro
+        ])
+        
+    def update(self):
+        self.x += self.vx
+        self.y += self.vy
+        if self.y < -10:
+            self.y = SCREEN_H + 10
+            self.x = random.uniform(0, SCREEN_W)
+            
+    def draw(self, surf):
+        s = pygame.Surface((self.r * 2, self.r * 2), pygame.SRCALPHA)
+        pygame.draw.circle(s, self.color, (self.r, self.r), self.r)
+        surf.blit(s, (int(self.x - self.r), int(self.y - self.r)))
+
+
+# ─── Threads de Detecção e Pré-visualização de Câmera ────────────────────────
+class CameraScanner(threading.Thread):
+    """Escaneia as câmeras disponíveis (de 0 a 4) em segundo plano de forma assíncrona."""
+    def __init__(self):
+        super().__init__()
+        self.available_cameras = []
+        self.scanning = True
+        self.daemon = True
+
+    def run(self):
+        for index in range(5):
+            cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
+            if not cap.isOpened():
+                cap = cv2.VideoCapture(index)
+            if cap.isOpened():
+                ret, frame = cap.read()
+                if ret:
+                    self.available_cameras.append(index)
+                cap.release()
+            time.sleep(0.05)
+        self.scanning = False
+
+
+class CameraPreview(threading.Thread):
+    """Thread dedicada para capturar frames de uma câmera específica para o preview ao vivo."""
+    def __init__(self, camera_index):
+        super().__init__()
+        self.camera_index = camera_index
+        self.cap = None
+        self.running = True
+        self.latest_frame = None
+        self.status = "loading"  # "loading", "active", "error"
+        self.lock = threading.Lock()
+        self.daemon = True
+
+    def run(self):
+        cap = cv2.VideoCapture(self.camera_index, cv2.CAP_DSHOW)
+        if not cap.isOpened():
+            cap = cv2.VideoCapture(self.camera_index)
+        
+        if not cap.isOpened():
+            with self.lock:
+                self.status = "error"
+            return
+
+        self.cap = cap
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 360)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+        with self.lock:
+            self.status = "active"
+
+        while self.running:
+            ret, frame = self.cap.read()
+            if ret:
+                frame = cv2.flip(frame, 1)
+                with self.lock:
+                    self.latest_frame = frame
+            else:
+                time.sleep(0.01)
+
+        self.cap.release()
+
+    def get_frame(self):
+        with self.lock:
+            return self.latest_frame.copy() if self.latest_frame is not None else None
+
+    def stop(self):
+        self.running = False
+
+
+# ─── Menu de Seleção de Câmera ──────────────────────────────────────────────
+def select_camera_menu(screen, fonts):
+    """Exibe um menu estilizado para o jogador selecionar e testar a câmera conectada."""
+    scanner = CameraScanner()
+    scanner.start()
+
+    particles = [MenuParticle() for _ in range(35)]
+    cameras = []
+    camera_rects = []
+    
+    selected_idx = 0
+    preview_thread = None
+    last_preview_index = -1
+    
+    retry_btn_rect = pygame.Rect(0, 0, 0, 0)
+    confirm_btn_rect = pygame.Rect(0, 0, 0, 0)
+
+    font_sub = fonts['sub']
+    font_label = fonts['label']
+    font_small = fonts['small']
+
+    running_menu = True
+    clock = pygame.time.Clock()
+
+    while running_menu:
+        clock.tick(30)
+        
+        # Entrada de eventos
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                pygame.quit()
+                sys.exit()
+            elif event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    pygame.quit()
+                    sys.exit()
+                elif event.key == pygame.K_UP:
+                    if len(cameras) > 0:
+                        selected_idx = (selected_idx - 1) % len(cameras)
+                elif event.key == pygame.K_DOWN:
+                    if len(cameras) > 0:
+                        selected_idx = (selected_idx + 1) % len(cameras)
+                elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_SPACE):
+                    if len(cameras) > 0:
+                        chosen_cam = cameras[selected_idx]
+                        if preview_thread:
+                            preview_thread.stop()
+                            preview_thread.join(timeout=1.0)
+                        return chosen_cam
+                    else:
+                        if preview_thread:
+                            preview_thread.stop()
+                            preview_thread.join(timeout=1.0)
+                        return 0
+            elif event.type == pygame.MOUSEBUTTONDOWN:
+                if event.button == 1:
+                    mx, my = pygame.mouse.get_pos()
+                    for i, rect in enumerate(camera_rects):
+                        if rect.collidepoint(mx, my):
+                            selected_idx = i
+                    if confirm_btn_rect.collidepoint(mx, my):
+                        if len(cameras) > 0:
+                            chosen_cam = cameras[selected_idx]
+                            if preview_thread:
+                                preview_thread.stop()
+                                preview_thread.join(timeout=1.0)
+                            return chosen_cam
+                        else:
+                            if preview_thread:
+                                preview_thread.stop()
+                                preview_thread.join(timeout=1.0)
+                            return 0
+                    if not scanner.scanning and len(cameras) == 0:
+                        if retry_btn_rect.collidepoint(mx, my):
+                            scanner = CameraScanner()
+                            scanner.start()
+                            selected_idx = 0
+
+        # Atualiza a lista de câmeras detectadas
+        cameras = scanner.available_cameras
+        
+        if len(cameras) > 0:
+            selected_idx = min(selected_idx, len(cameras) - 1)
+            active_cam_index = cameras[selected_idx]
+        else:
+            active_cam_index = 0
+            
+        # Inicia ou atualiza a thread de preview
+        if active_cam_index != last_preview_index:
+            if preview_thread:
+                preview_thread.stop()
+            preview_thread = CameraPreview(active_cam_index)
+            preview_thread.start()
+            last_preview_index = active_cam_index
+
+        # Desenhar Fundo e Partículas
+        screen.blit(get_start_bg_gradient(), (0, 0))
+        for p in particles:
+            p.update()
+            p.draw(screen)
+
+        # Painel central de Glassmorphism
+        panel_rect = pygame.Rect(100, 80, 1080, 560)
+        panel_surf = pygame.Surface((panel_rect.width, panel_rect.height), pygame.SRCALPHA)
+        panel_surf.fill((10, 15, 30, 205))
+        pygame.draw.rect(panel_surf, (90, 40, 130, 180), (0, 0, panel_rect.width, panel_rect.height), 2, border_radius=18)
+        screen.blit(panel_surf, panel_rect.topleft)
+
+        # Títulos estilizados
+        title_surf = fonts['title'].render("CONFIGURAÇÃO DA CÂMERA 🎥", True, (255, 255, 255))
+        screen.blit(title_surf, (panel_rect.x + 40, panel_rect.y + 35))
+        
+        desc_surf = font_small.render("Selecione qual câmera deseja usar para fatiar frutas com o indicador na tela.", True, (170, 195, 225))
+        screen.blit(desc_surf, (panel_rect.x + 40, panel_rect.y + 80))
+
+        # ── Coluna Esquerda: Câmeras Disponíveis ──
+        col_x = panel_rect.x + 40
+        col_y = panel_rect.y + 120
+
+        lbl_list = font_label.render("DISPOSITIVOS DETECTADOS", True, (0, 230, 255))
+        screen.blit(lbl_list, (col_x, col_y))
+
+        camera_rects = []
+        
+        if scanner.scanning and len(cameras) == 0:
+            pulse_alpha = int(150 + 105 * math.sin(pygame.time.get_ticks() * 0.01))
+            scan_surf = font_sub.render("Procurando câmeras...", True, (255, 220, 0))
+            scan_surf.set_alpha(pulse_alpha)
+            screen.blit(scan_surf, (col_x, col_y + 60))
+            
+            loader_angle = (pygame.time.get_ticks() // 8) % 360
+            loader_r = 25
+            loader_center = (col_x + 150, col_y + 160)
+            pygame.draw.circle(screen, (40, 45, 60), loader_center, loader_r, 4)
+            for a in range(0, 120, 10):
+                rad = math.radians(loader_angle + a)
+                lx = loader_center[0] + int(math.cos(rad) * loader_r)
+                ly = loader_center[1] + int(math.sin(rad) * loader_r)
+                pygame.draw.circle(screen, (0, 230, 255), (lx, ly), 3)
+                
+        elif not scanner.scanning and len(cameras) == 0:
+            error_surf1 = font_sub.render("Nenhuma câmera detectada!", True, (255, 100, 110))
+            screen.blit(error_surf1, (col_x, col_y + 40))
+            error_surf2 = font_small.render("Verifique as conexões do dispositivo.", True, (150, 150, 160))
+            screen.blit(error_surf2, (col_x, col_y + 75))
+
+            retry_btn_rect = pygame.Rect(col_x, col_y + 120, 300, 45)
+            mx, my = pygame.mouse.get_pos()
+            is_hover_retry = retry_btn_rect.collidepoint(mx, my)
+            btn_col = (90, 40, 130) if is_hover_retry else (50, 25, 80)
+            
+            pygame.draw.rect(screen, btn_col, retry_btn_rect, border_radius=8)
+            pygame.draw.rect(screen, (255, 50, 100), retry_btn_rect, 2, border_radius=8)
+            
+            retry_txt = font_label.render("🔄 Tentar Novamente", True, (255, 255, 255))
+            screen.blit(retry_txt, (retry_btn_rect.x + (retry_btn_rect.width - retry_txt.get_width())//2, retry_btn_rect.y + 10))
+            
+            force_txt = font_small.render("Ou tente iniciar com o Index 0:", True, (180, 180, 180))
+            screen.blit(force_txt, (col_x, col_y + 195))
+            
+            btn_rect = pygame.Rect(col_x, col_y + 225, 360, 50)
+            pygame.draw.rect(screen, (20, 25, 45), btn_rect, border_radius=10)
+            pygame.draw.rect(screen, (0, 230, 255), btn_rect, 2, border_radius=10)
+            txt_btn = font_label.render("Forçar Câmera Padrão (Index 0)", True, (255, 255, 255))
+            screen.blit(txt_btn, (btn_rect.x + 20, btn_rect.y + 14))
+            camera_rects.append(btn_rect)
+            cameras = [0]
+        else:
+            cy = col_y + 40
+            for i, cam_id in enumerate(cameras):
+                btn_rect = pygame.Rect(col_x, cy, 360, 52)
+                camera_rects.append(btn_rect)
+                
+                mx, my = pygame.mouse.get_pos()
+                is_hover = btn_rect.collidepoint(mx, my)
+                is_selected = (i == selected_idx)
+                
+                btn_offset = 6 if (is_hover or is_selected) else 0
+                draw_rect = pygame.Rect(btn_rect.x + btn_offset, btn_rect.y, btn_rect.width - btn_offset, btn_rect.height)
+                
+                if is_selected:
+                    fill_col = (25, 45, 80, 220)
+                    border_col = (0, 230, 255)
+                    text_col = (255, 255, 255)
+                elif is_hover:
+                    fill_col = (20, 30, 55, 180)
+                    border_col = (56, 189, 248)
+                    text_col = (220, 240, 255)
+                else:
+                    fill_col = (12, 16, 32, 130)
+                    border_col = (60, 65, 90)
+                    text_col = (160, 180, 210)
+                    
+                s_btn = pygame.Surface((draw_rect.width, draw_rect.height), pygame.SRCALPHA)
+                s_btn.fill(fill_col)
+                screen.blit(s_btn, draw_rect.topleft)
+                pygame.draw.rect(screen, border_col, draw_rect, 2, border_radius=10)
+                
+                cam_name = f"Câmera Principal" if cam_id == 0 else f"Câmera Auxiliar {cam_id}"
+                cam_label = f"📷 {cam_name} (Index {cam_id})"
+                
+                if is_selected:
+                    pygame.draw.circle(screen, (0, 230, 255), (draw_rect.x + 22, draw_rect.y + 26), 5)
+                    txt_surf = font_label.render(cam_label, True, text_col)
+                    screen.blit(txt_surf, (draw_rect.x + 40, draw_rect.y + 15))
+                else:
+                    txt_surf = font_label.render(cam_label, True, text_col)
+                    screen.blit(txt_surf, (draw_rect.x + 25, draw_rect.y + 15))
+                
+                cy += 65
+
+            if scanner.scanning:
+                scan_status = f"Escaneando... {len(cameras)} encontradas"
+                status_color = (255, 220, 0)
+            else:
+                scan_status = f"Busca concluída: {len(cameras)} dispositivos prontos"
+                status_color = (0, 230, 120)
+                
+            status_surf = font_small.render(scan_status, True, status_color)
+            screen.blit(status_surf, (col_x, col_y + 325))
+
+        # ── Coluna Direita: Preview da Câmera ──
+        prev_x = panel_rect.x + 470
+        prev_y = panel_rect.y + 120
+        prev_w = 560
+        prev_h = 315
+
+        lbl_prev = font_label.render("PREVISÃO EM TEMPO REAL", True, (255, 50, 100))
+        screen.blit(lbl_prev, (prev_x, prev_y))
+
+        prev_rect = pygame.Rect(prev_x, prev_y + 30, prev_w, prev_h)
+        pygame.draw.rect(screen, (10, 12, 22), prev_rect, border_radius=12)
+        
+        preview_drawn = False
+        if preview_thread:
+            frame = preview_thread.get_frame()
+            status = preview_thread.status
+            
+            if status == "active" and frame is not None:
+                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                surf_frame = pygame.image.frombuffer(rgb_frame, (640, 360), 'RGB').convert()
+                surf_resized = pygame.transform.smoothscale(surf_frame, (prev_w, prev_h))
+                screen.blit(surf_resized, prev_rect.topleft)
+                preview_drawn = True
+            elif status == "loading":
+                pulse_text = font_small.render("Inicializando fluxo de vídeo...", True, (150, 150, 160))
+                screen.blit(pulse_text, (prev_rect.centerx - pulse_text.get_width()//2, prev_rect.centery - 10))
+                
+                loader_angle = (pygame.time.get_ticks() // 6) % 360
+                loader_center = (prev_rect.centerx, prev_rect.centery + 30)
+                pygame.draw.circle(screen, (40, 45, 60), loader_center, 15, 3)
+                for a in range(0, 90, 15):
+                    rad = math.radians(loader_angle + a)
+                    lx = loader_center[0] + int(math.cos(rad) * 15)
+                    ly = loader_center[1] + int(math.sin(rad) * 15)
+                    pygame.draw.circle(screen, (255, 50, 100), (lx, ly), 2)
+            elif status == "error":
+                error_txt1 = font_label.render("⚠️ FALHA NA CÂMERA", True, (255, 100, 110))
+                screen.blit(error_txt1, (prev_rect.centerx - error_txt1.get_width()//2, prev_rect.centery - 20))
+                error_txt2 = font_small.render("O dispositivo pode estar em uso por outro app.", True, (150, 150, 160))
+                screen.blit(error_txt2, (prev_rect.centerx - error_txt2.get_width()//2, prev_rect.centery + 10))
+        else:
+            wait_text = font_small.render("Aguardando seleção de câmera...", True, (150, 150, 160))
+            screen.blit(wait_text, (prev_rect.centerx - wait_text.get_width()//2, prev_rect.centery))
+
+        border_neon_col = (0, 230, 255) if preview_drawn else (90, 40, 130)
+        pygame.draw.rect(screen, border_neon_col, prev_rect, 3, border_radius=12)
+
+        # ── Botão de Confirmação ──
+        confirm_btn_rect = pygame.Rect(prev_x, prev_y + 30 + prev_h + 20, prev_w, 54)
+        mx, my = pygame.mouse.get_pos()
+        is_hover_confirm = confirm_btn_rect.collidepoint(mx, my)
+        
+        pulse_val = 4 + int(math.sin(pygame.time.get_ticks() * 0.01) * 2)
+        if is_hover_confirm:
+            btn_color = (0, 200, 100)
+            glow_color = (0, 230, 120)
+            btn_scale = 2
+        else:
+            btn_color = (0, 150, 75)
+            glow_color = (0, 180, 90)
+            btn_scale = 0
+            
+        draw_glow_rect(screen, glow_color, confirm_btn_rect, glow=pulse_val + btn_scale)
+        pygame.draw.rect(screen, btn_color, confirm_btn_rect, border_radius=12)
+        pygame.draw.rect(screen, (255, 255, 255), confirm_btn_rect, 2, border_radius=12)
+        
+        confirm_txt = font_label.render("CONFIRMAR CÂMERA E INICIAR", True, (255, 255, 255))
+        screen.blit(confirm_txt, (confirm_btn_rect.x + (confirm_btn_rect.width - confirm_txt.get_width())//2, confirm_btn_rect.y + 11))
+        
+        hint_confirm = font_small.render("Pressione ENTER ou clique para confirmar", True, (150, 175, 200))
+        screen.blit(hint_confirm, (confirm_btn_rect.x + (confirm_btn_rect.width - hint_confirm.get_width())//2, confirm_btn_rect.y + 36))
+
+        pygame.display.flip()
+
+    if preview_thread:
+        preview_thread.stop()
+        preview_thread.join(timeout=1.0)
+
+
 # ─── Hand tracker ───────────────────────────────────────────────────────────
 class HandTracker:
-    def __init__(self, model_path=None):
+    def __init__(self, model_path=None, camera_index=0):
         self.available = False
         self.cap = None
         self.landmarker = None
@@ -1056,7 +1481,9 @@ class HandTracker:
             print(f"[AVISO] HandLandmarker falhou ao inicializar: {e}")
             return
 
-        self.cap = cv2.VideoCapture(0)
+        self.cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
+        if not self.cap.isOpened():
+            self.cap = cv2.VideoCapture(camera_index)
         if not self.cap.isOpened():
             print("[AVISO] Câmera indisponível.")
             self.cap = None
@@ -1365,7 +1792,8 @@ def main():
     clock  = pygame.time.Clock()
     fonts  = make_fonts()
 
-    tracker = HandTracker(MODEL_PATH)
+    camera_index = select_camera_menu(screen, fonts)
+    tracker = HandTracker(MODEL_PATH, camera_index)
     game    = FruitNinjaGame()
     trail   = SliceTrail()
     lost_frames = 0
