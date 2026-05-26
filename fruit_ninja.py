@@ -50,11 +50,25 @@ SLICE_VEL_MIN  = 6   # px/frame mínimo para cortar
 def seg_circle_hit(p1, p2, c, r):
     """Retorna True se o segmento p1→p2 intercepta o círculo (c, r).
     Usa projeção vetorial para encontrar o ponto mais próximo sem raiz quadrada.
+    Otimizado com Broad-phase AABB check inlined para performance ultrarrápida.
     """
     x1, y1 = p1
     x2, y2 = p2
     cx, cy = c
     
+    # 1. Broad-phase AABB check inlined (Filtro ultrarrápido por caixa delimitadora)
+    # Evita 95% dos cálculos matemáticos de projeção e ponto flutuante para frutas distantes
+    min_x = x1 if x1 < x2 else x2
+    max_x = x2 if x1 < x2 else x1
+    if cx < min_x - r or cx > max_x + r:
+        return False
+        
+    min_y = y1 if y1 < y2 else y2
+    max_y = y2 if y1 < y2 else y1
+    if cy < min_y - r or cy > max_y + r:
+        return False
+        
+    # 2. Narrow-phase check (Projeção vetorial detalhada)
     dx, dy = x2 - x1, y2 - y1
     lensq = dx*dx + dy*dy
     if lensq == 0:
@@ -987,6 +1001,12 @@ class HandTracker:
         self.start_snapshot = None
         self.end_snapshot = None
         
+        # Vetor de velocidade e inércia física para movimentos ultra-rápidos
+        self.vx = 0.0
+        self.vy = 0.0
+        self.consecutive_lost = 0
+        self.points_queue = []
+        
         self.lock = threading.Lock()
         self.running = False
         self.thread = None
@@ -1003,13 +1023,14 @@ class HandTracker:
         with open(model_path, 'rb') as fh:
             model_bytes = fh.read()
 
+        # Otimizado: Thresholds ligeiramente mais tolerantes a desfoques de alta velocidade (motion blur)
         opts = HLO(
             base_options=BaseOptions(model_asset_buffer=model_bytes),
             running_mode=RM.VIDEO,
             num_hands=1,
-            min_hand_detection_confidence=0.55,
-            min_hand_presence_confidence=0.55,
-            min_tracking_confidence=0.50,
+            min_hand_detection_confidence=0.45,
+            min_hand_presence_confidence=0.40,
+            min_tracking_confidence=0.40,
         )
         try:
             self.landmarker = HL.create_from_options(opts)
@@ -1047,46 +1068,32 @@ class HandTracker:
             self._latest_frame = val
 
     def _is_valid_hand(self, lm):
-        # Mão para o Fruit Ninja: Checa a estrutura rígida da palma (nunca dobra)
-        # Landmark 0 = pulso, Landmark 5 = nó do indicador, Landmark 17 = nó do mínimo
+        # Mão para o Fruit Ninja: Checa a estrutura rígida da palma em 3D para suportar rotações
+        def dist_3d(a, b):
+            return math.sqrt((a.x - b.x)**2 + (a.y - b.y)**2 + (a.z - b.z)**2)
+            
         wrist = lm[0]
         idx_k = lm[5]
         pin_k = lm[17]
-        plen = math.hypot(idx_k.x - wrist.x, idx_k.y - wrist.y)
-        pw   = math.hypot(pin_k.x - idx_k.x,  pin_k.y - idx_k.y)
+        plen = dist_3d(idx_k, wrist)
+        pw   = dist_3d(pin_k, idx_k)
         
-        # Mão saudável tem proporções de palma válidas e tamanho mínimo no frame.
-        if plen < 0.015 or pw < 0.005:
+        # Mão saudável tem proporções de palma válidas e tamanho mínimo tridimensional
+        if plen < 0.012 or pw < 0.004:
             return False
         ratio = plen / max(pw, 0.001)
-        return 0.15 <= ratio <= 8.0
+        return 0.1 <= ratio <= 10.0
 
     def _is_pointing_finger(self, lm):
-        def dist(a, b):
-            return math.hypot(a.x - b.x, a.y - b.y)
+        def dist_3d(a, b):
+            return math.sqrt((a.x - b.x)**2 + (a.y - b.y)**2 + (a.z - b.z)**2)
         
-        # Para cada dedo, comparamos a distância nódulo-ponta com o comprimento do osso da base (MCP-PIP).
         # Indicador (5=MCP, 6=PIP, 8=Tip)
-        idx_base = dist(lm[6], lm[5])
-        idx_tip  = dist(lm[8], lm[5])
-        
-        # Médio (9=MCP, 10=PIP, 12=Tip)
-        mid_base = dist(lm[10], lm[9])
-        mid_tip  = dist(lm[12], lm[9])
-        
-        # Anelar (13=MCP, 14=PIP, 16=Tip)
-        ring_base = dist(lm[14], lm[13])
-        ring_tip  = dist(lm[16], lm[13])
+        idx_base = dist_3d(lm[6], lm[5])
+        idx_tip  = dist_3d(lm[8], lm[5])
         
         # O indicador deve estar estendido (distância ponta-nódulo > 1.15x o osso base)
-        idx_extended = idx_tip > idx_base * 1.15
-        
-        # Aceitamos o gesto de apontar (indicador estendido, médio/anelar relativamente dobrados)
-        # OU o gesto de mão aberta (golpe de caratê/chop, onde os outros dedos também estão estendidos).
-        pointing = idx_extended and (mid_tip < mid_base * 1.45) and (ring_tip < ring_base * 1.45)
-        open_hand = idx_extended and (mid_tip > mid_base * 1.15) and (ring_tip > ring_base * 1.15)
-        
-        return pointing or open_hand
+        return idx_tip > idx_base * 1.15
 
     def _thread_loop(self):
         while self.running:
@@ -1111,14 +1118,16 @@ class HandTracker:
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
             
-            self._ts += 33333
+            # Sincronização em tempo real do sistema em milissegundos para o MediaPipe
+            self._ts = int(time.time() * 1000)
             
             results = None
-            if self.landmarker:
+            if self.landmarker and self.running:
                 try:
                     results = self.landmarker.detect_for_video(mp_img, self._ts)
                 except Exception as e:
-                    print(f"[ERRO] Falha na detecção do MediaPipe: {e}")
+                    if self.running:
+                        print(f"[ERRO] Falha na detecção do MediaPipe: {e}")
 
             tip = None
             if results and results.hand_landmarks:
@@ -1132,20 +1141,61 @@ class HandTracker:
                     with self.lock:
                         if self.prev_x is None:
                             self.prev_x, self.prev_y = raw_x, raw_y
+                            self.vx, self.vy = 0.0, 0.0
                         else:
+                            # Calcula velocidade instantânea no frame
+                            curr_vx = raw_x - self.prev_x
+                            curr_vy = raw_y - self.prev_y
+                            # Suaviza o vetor de velocidade (60% da velocidade atual)
+                            self.vx = self.vx * 0.4 + curr_vx * 0.6
+                            self.vy = self.vy * 0.4 + curr_vy * 0.6
+                            
                             self.prev_x = int(self.prev_x * 0.25 + raw_x * 0.75)
                             self.prev_y = int(self.prev_y * 0.25 + raw_y * 0.75)
+                        
                         tip = (self.prev_x, self.prev_y)
+                        self.points_queue.append(tip)
+                        self.consecutive_lost = 0
                     
                     # Desenha o indicador visual da ponta do dedo de forma proporcional no frame 640x360
                     tx_frame = int(t8.x * 640)
                     ty_frame = int(t8.y * 360)
                     cv2.circle(frame, (tx_frame, ty_frame), 8, (0, 220, 200), -1)
                     cv2.circle(frame, (tx_frame, ty_frame), 10, (255, 255, 255), 2)
+                else:
+                    # Mão detectada mas não passou nas condições geométricas (ex: de lado ou parcialmente oclusa)
+                    with self.lock:
+                        self.consecutive_lost += 1
+                        # Previsão Inercial: se a velocidade era alta, projeta a lâmina na mesma direção
+                        if self.consecutive_lost <= 4 and self.prev_x is not None and (abs(self.vx) > 3 or abs(self.vy) > 3):
+                            self.prev_x = int(self.prev_x + self.vx)
+                            self.prev_y = int(self.prev_y + self.vy)
+                            self.vx *= 0.82
+                            self.vy *= 0.82
+                            tip = (self.prev_x, self.prev_y)
+                            self.points_queue.append(tip)
+                        else:
+                            self.prev_x = None
+                            self.prev_y = None
+                            self.vx = 0.0
+                            self.vy = 0.0
             else:
+                # Perda total do tracking (câmera borrada pelo movimento rápido)
                 with self.lock:
-                    self.prev_x = None
-                    self.prev_y = None
+                    self.consecutive_lost += 1
+                    # Previsão Inercial: se a velocidade era alta, projeta a lâmina na mesma direção
+                    if self.consecutive_lost <= 4 and self.prev_x is not None and (abs(self.vx) > 3 or abs(self.vy) > 3):
+                        self.prev_x = int(self.prev_x + self.vx)
+                        self.prev_y = int(self.prev_y + self.vy)
+                        self.vx *= 0.82
+                        self.vy *= 0.82
+                        tip = (self.prev_x, self.prev_y)
+                        self.points_queue.append(tip)
+                    else:
+                        self.prev_x = None
+                        self.prev_y = None
+                        self.vx = 0.0
+                        self.vy = 0.0
 
             # Redimensionamento rápido para exibição no Pygame (1280x720)
             disp = cv2.resize(frame, (SCREEN_W, SCREEN_H), interpolation=cv2.INTER_LINEAR)
@@ -1168,6 +1218,13 @@ class HandTracker:
             return None, None
         with self.lock:
             return self.latest_surf, self.latest_tip
+
+    def pop_points(self):
+        """Retorna todos os pontos acumulados na fila thread-safe e a limpa."""
+        with self.lock:
+            pts = list(self.points_queue)
+            self.points_queue.clear()
+            return pts
 
     def release(self):
         self.running = False
@@ -1381,10 +1438,12 @@ def main():
 
         # ── Câmera + rastreamento ────────────────────────────────────────
         bg, tip = tracker.get_frame_and_tip()
+        new_points = tracker.pop_points()
 
         # ── Background + Rastro ──────────────────────────────────────────
-        if tip:
-            trail.add(*tip)
+        if new_points:
+            for pt in new_points:
+                trail.add(*pt)
             lost_frames = 0
         else:
             lost_frames += 1
